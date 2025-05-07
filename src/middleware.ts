@@ -1,55 +1,36 @@
-import type {
-  MiddlewareConfig,
-  NextFetchEvent,
-  NextRequest,
-} from "next/server";
-
 import { clerkMiddleware, createRouteMatcher } from "@clerk/nextjs/server";
-import createMiddleware from "next-intl/middleware";
 import { NextResponse } from "next/server";
 
-import { routing } from "~/i18n/routing";
+import { MFA_ENABLED } from "~/app";
 
-const isProtectedRoute = createRouteMatcher(["/dashboard(.*)"]);
+const isMFARoute = createRouteMatcher(["/auth/mfa(.*)"]);
+const isSignInRoute = createRouteMatcher(["/auth/sign-in(.*)"]);
 
-// Define routes to exclude from next-intl and Clerk middleware
-const excludedRoutes = ["/api/unkey"];
+export default clerkMiddleware(async (auth, req) => {
+  if (!MFA_ENABLED) return;
+  const { sessionClaims, userId } = await auth();
 
-const shouldUseClerk = true; // TODO: consider `const shouldUseClerk = Boolean(env.NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY);`
-const shouldUseIntl = true;
-
-const createIntlMiddlewareInstance = createMiddleware(routing);
-
-function handleClerkMiddleware(request: NextRequest, event: NextFetchEvent) {
-  return clerkMiddleware(async (auth, request) => {
-    if (isProtectedRoute(request)) {
-      await auth.protect();
-    }
-    return shouldUseIntl
-      ? createIntlMiddlewareInstance(request)
-      : NextResponse.next();
-  })(request, event);
-}
-
-export function middleware(request: NextRequest, event: NextFetchEvent) {
-  const pathname = request.nextUrl.pathname;
-
-  // Check if the request path is excluded
-  const isExcluded = excludedRoutes.some((route) => pathname.startsWith(route));
-
-  if (isExcluded) {
-    return NextResponse.next();
+  // Redirect to homepage if the user is signed in and on the sign-in page
+  if (userId !== null && isSignInRoute(req)) {
+    return NextResponse.redirect(new URL("/", req.url));
   }
 
-  return shouldUseClerk
-    ? handleClerkMiddleware(request, event)
-    : NextResponse.next();
-}
+  // Redirect to MFA setup page if MFA is not enabled
+  if (userId !== null && !isMFARoute(req)) {
+    if (sessionClaims.isMfa === undefined) {
+      console.error("You need to add the `isMfa` claim to your session token.");
+    }
+    if (sessionClaims.isMfa === false) {
+      return NextResponse.redirect(new URL("/auth/mfa", req.url));
+    }
+  }
+});
 
-export const config: MiddlewareConfig = {
+export const config = {
   matcher: [
+    // Skip Next.js internals and all static files, unless found in search params
     "/((?!_next|[^?]*\\.(?:html?|css|js(?!on)|jpe?g|webp|png|gif|svg|ttf|woff2?|ico|csv|docx?|xlsx?|zip|webmanifest)).*)",
-    "/(de|en|es|fr|hi|it|ms|pl|tr|uk|zh)/:path*",
+    // Always run for API routes
     "/(api|trpc)(.*)",
   ],
 };

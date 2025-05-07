@@ -13,9 +13,9 @@
     "usesession": "UseSession"
   },
   "CartAddForm": {
-    "addOneItem": "Додайте один предмет",
+    "addOneItem": "Додати один айтем",
     "quantity": "Кількість",
-    "removeOneItem": "Видаліть один елемент"
+    "removeOneItem": "Видалити один айтем"
   },
   "CommerceDashboard": {
     "dashboard": "Дашборд"

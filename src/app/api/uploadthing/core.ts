@@ -1,34 +1,115 @@
-import { currentUser } from "@clerk/nextjs/server";
+import { createId } from "@paralleldrive/cuid2";
 import { createUploadthing, type FileRouter } from "uploadthing/next";
 import { UploadThingError } from "uploadthing/server";
 
-const f = createUploadthing();
+import { db } from "~/db";
+import { uploadsTable } from "~/db/schema";
+import { auth } from "~/lib/auth";
 
-// FileRouter for your app, can contain multiple FileRoutes
+const f = createUploadthing();
+// FileRouter for the app, can contain multiple FileRoutes
 export const ourFileRouter = {
   // Define as many FileRoutes as you like, each with a unique routeSlug
-  productImage: f({ image: { maxFileSize: "4MB", maxFileCount: 3 } })
+  imageUploader: f({
+    image: {
+      // Allow multiple images for a gallery
+      maxFileCount: 10,
+      /**
+       * For full list of options and defaults, see the File Route API reference
+       * @see https://docs.uploadthing.com/file-routes#route-config
+       */
+      maxFileSize: "4MB",
+    },
+  })
     // Set permissions and file types for this FileRoute
-    .middleware(async ({ req }) => {
+    .middleware(async () => {
       // This code runs on your server before upload
-      const user = await currentUser();
+      // Get the user session using Clerk
+      const { userId } = await auth();
+      if (!userId) throw new UploadThingError("Unauthorized");
+      // Whatever is returned here is accessible in onUploadComplete as `metadata`
+      // Ensure userId is correctly passed
+      return { userId };
+    })
+    .onUploadComplete(async ({ file, metadata }) => {
+      // This code RUNS ON THE SERVER after upload
+      console.log("Upload complete for userId (image):", metadata.userId);
+      console.log("file url", file.ufsUrl); // Public CDN URL is useful info
+      console.log("file key", file.key);
 
-      // If you throw, the user will not be able to upload
-      if (!user) {
-        throw new UploadThingError("Unauthorized");
+      // Save the upload details to the database
+      try {
+        await db.insert(uploadsTable).values({
+          id: createId(),
+          key: file.key,
+          type: "image",
+          url: file.ufsUrl, // Store the public CDN URL
+          userId: metadata.userId,
+        });
+        console.log(
+          "Saved image upload details to database for userId:",
+          metadata.userId,
+        );
+      } catch (error) {
+        console.error(
+          "Failed to save image upload details to database:",
+          error,
+        );
+        // Optionally, you might want to delete the file from UploadThing if DB insert fails
+        // await utapi.deleteFiles(file.key);
+        throw new UploadThingError("Failed to process upload metadata.");
       }
 
-      // Whatever is returned here is accessible in onUploadComplete as `metadata`
-      return { userId: user.id };
-    })
-    .onUploadComplete(async ({ metadata, file }) => {
-      // This code RUNS ON YOUR SERVER after upload
-      console.log("Upload complete for userId:", metadata.userId);
-
-      console.log("file url", file.url);
-
       // !!! Whatever is returned here is sent to the clientside `onClientUploadComplete` callback
-      return { uploadedBy: metadata.userId };
+      // Return necessary info, like the file URL or key, if needed on the client
+      return {
+        fileKey: file.key,
+        fileUrl: file.ufsUrl,
+        uploadedBy: metadata.userId,
+      };
+    }),
+
+  // New route for video uploads
+  videoUploader: f({
+    video: { maxFileCount: 5, maxFileSize: "64MB" },
+  })
+    .middleware(async () => {
+      // Same middleware logic as imageUploader
+      const { userId } = await auth();
+      if (!userId) throw new UploadThingError("Unauthorized");
+      return { userId };
+    })
+    .onUploadComplete(async ({ file, metadata }) => {
+      console.log("Upload complete for userId (video):", metadata.userId);
+      console.log("file url", file.ufsUrl); // Public CDN URL is useful info
+      console.log("file key", file.key);
+
+      // Save the upload details to the database
+      try {
+        await db.insert(uploadsTable).values({
+          id: createId(),
+          key: file.key,
+          type: "video", // Explicitly set type to video
+          url: file.ufsUrl,
+          userId: metadata.userId,
+        });
+        console.log(
+          "Saved video upload details to database for userId:",
+          metadata.userId,
+        );
+      } catch (error) {
+        console.error(
+          "Failed to save video upload details to database:",
+          error,
+        );
+        throw new UploadThingError("Failed to process upload metadata.");
+      }
+
+      return {
+        fileKey: file.key,
+        fileUrl: file.ufsUrl,
+        uploadedBy: metadata.userId,
+      };
     }),
 } satisfies FileRouter;
 

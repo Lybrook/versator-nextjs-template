@@ -1,13 +1,18 @@
 import type { NextConfig } from "next";
 
-import createNextIntlPlugin from "next-intl/plugin";
-
-const withNextIntl = createNextIntlPlugin();
-
-const nextConfig: NextConfig = {
-  // done manually using bun check
+export default {
   eslint: { ignoreDuringBuilds: true },
-  typescript: { ignoreBuildErrors: true },
-};
-
-export default withNextIntl(nextConfig);
+  images: {
+    formats: ["image/avif", "image/webp"],
+    remotePatterns: [
+      { hostname: "**.githubassets.com", protocol: "https" },
+      { hostname: "**.githubusercontent.com", protocol: "https" },
+      { hostname: "**.googleusercontent.com", protocol: "https" },
+      { hostname: "**.ufs.sh", protocol: "https" },
+      { hostname: "**.unsplash.com", protocol: "https" },
+      { hostname: "api.github.com", protocol: "https" },
+      { hostname: "utfs.io", protocol: "https" },
+      { hostname: "img.clerk.com", protocol: "https" },
+    ],
+  },
+} satisfies NextConfig;

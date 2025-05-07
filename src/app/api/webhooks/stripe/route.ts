@@ -1,245 +1,154 @@
-import type Stripe from "stripe";
-
-import { clerkClient } from "@clerk/nextjs/server";
-import { eq } from "drizzle-orm";
-import { revalidateTag } from "next/cache";
 import { headers } from "next/headers";
-import { z } from "zod";
+import { NextResponse } from "next/server";
+import { Webhook, type WebhookRequiredHeaders } from "svix";
 
-import { env } from "~/env.js";
-import { db } from "~/server/db";
-import {
-  addresses,
-  carts,
-  orders,
-  payments,
-  products,
-} from "~/server/db/schema";
-import { stripe } from "~/server/stripe";
-import {
-  checkoutItemSchema,
-  type CheckoutItemSchema,
-} from "~/server/validations/cart";
+import { SVIX_ENABLED } from "~/app";
+import { stripe } from "~/lib/stripe";
+import { syncStripeDataToKV } from "~/lib/stripe-sync";
+
+const allowedEvents = [
+  "checkout.session.completed",
+  "customer.subscription.created",
+  "customer.subscription.updated",
+  "customer.subscription.deleted",
+  "customer.subscription.paused",
+  "customer.subscription.resumed",
+  "customer.subscription.pending_update_applied",
+  "customer.subscription.pending_update_expired",
+  "customer.subscription.trial_will_end",
+  "invoice.paid",
+  "invoice.payment_failed",
+  "invoice.payment_action_required",
+  "invoice.upcoming",
+  "invoice.marked_uncollectible",
+  "invoice.payment_succeeded",
+  "payment_intent.succeeded",
+  "payment_intent.payment_failed",
+  "payment_intent.canceled",
+];
+
+interface StripeWebhookEvent {
+  [key: string]: unknown;
+  data: {
+    object: {
+      [key: string]: unknown;
+      customer: string;
+    };
+  };
+  type: string;
+}
 
 export async function POST(req: Request) {
   const body = await req.text();
-  const signature = (await headers()).get("Stripe-Signature") ?? "";
+  const headerPayload = await headers();
 
-  let event: Stripe.Event;
+  let event: StripeWebhookEvent;
 
-  try {
-    event = stripe.webhooks.constructEvent(
-      body,
-      signature,
-      env.STRIPE_WEBHOOK_SECRET || "",
-    );
-  } catch (err) {
-    return new Response(
-      `Webhook Error: ${err instanceof Error ? err.message : "Unknown error."}`,
-      { status: 400 },
-    );
-  }
-
-  switch (event.type) {
-    // Handling subscription events
-    case "checkout.session.completed":
-      const checkoutSessionCompleted = event.data.object;
-
-      // If there is a user id, and no cart id in the metadata, then this is a new subscription
-      if (
-        checkoutSessionCompleted.metadata?.userId &&
-        !checkoutSessionCompleted.metadata.cartId
-      ) {
-        // Retrieve the subscription details from Stripe
-        const subscription = await stripe.subscriptions.retrieve(
-          checkoutSessionCompleted.subscription as string,
-        );
-
-        // Update the user stripe into in our database.
-        // Since this is the initial subscription, we need to update
-        // the subscription id and customer id.
-        await (await clerkClient()).users.updateUserMetadata(
-          checkoutSessionCompleted.metadata.userId,
-          {
-            privateMetadata: {
-              stripeSubscriptionId: subscription.id,
-              stripeCustomerId: subscription.customer as string,
-              stripePriceId: subscription.items.data[0]?.price.id,
-              stripeCurrentPeriodEnd: new Date(
-                subscription.current_period_end * 1000,
-              ),
-            },
-          },
-        );
-      }
-      break;
-    case "invoice.payment_succeeded":
-      const invoicePaymentSucceeded = event.data.object;
-
-      // If there is a user id, and no cart id in the metadata, then this is a new subscription
-      if (
-        invoicePaymentSucceeded.metadata?.userId &&
-        !invoicePaymentSucceeded.metadata.cartId
-      ) {
-        // Retrieve the subscription details from Stripe
-        const subscription = await stripe.subscriptions.retrieve(
-          invoicePaymentSucceeded.subscription as string,
-        );
-
-        // Update the price id and set the new period end
-        await (await clerkClient()).users.updateUserMetadata(
-          invoicePaymentSucceeded.metadata.userId,
-          {
-            privateMetadata: {
-              stripePriceId: subscription.items.data[0]?.price.id,
-              stripeCurrentPeriodEnd: new Date(
-                subscription.current_period_end * 1000,
-              ),
-            },
-          },
-        );
-      }
-      revalidateTag(`${invoicePaymentSucceeded.metadata?.userId}-subscription`);
-      break;
-
-    // Handling payment events
-    case "payment_intent.payment_failed":
-      const paymentIntentPaymentFailed = event.data.object;
-      console.log(
-        `❌ Payment failed: ${paymentIntentPaymentFailed.last_payment_error?.message}`,
+  if (SVIX_ENABLED) {
+    // svix verification logic
+    const svixHeaders: WebhookRequiredHeaders = {
+      "svix-id": headerPayload.get("svix-id") ?? "",
+      "svix-signature": headerPayload.get("svix-signature") ?? "",
+      "svix-timestamp": headerPayload.get("svix-timestamp") ?? "",
+    };
+    if (
+      !svixHeaders["svix-id"] ||
+      !svixHeaders["svix-timestamp"] ||
+      !svixHeaders["svix-signature"]
+    ) {
+      console.error("[STRIPE HOOK] missing svix headers (svix enabled)");
+      return NextResponse.json(
+        { error: "missing svix headers" },
+        { status: 400 },
       );
-      break;
-    case "payment_intent.processing":
-      const paymentIntentProcessing = event.data.object;
-      console.log(`⏳ Payment processing: ${paymentIntentProcessing.id}`);
-      break;
-    case "payment_intent.succeeded":
-      const paymentIntentSucceeded = event.data.object;
+    }
 
-      const paymentIntentId = paymentIntentSucceeded.id;
-      const orderAmount = paymentIntentSucceeded.amount;
-      const checkoutItems = paymentIntentSucceeded.metadata
-        .items as unknown as CheckoutItemSchema[];
+    // todo: 🤔 maybe it should be STRIPE_SVIX_WEBHOOK_SECRET/SVIX_WEBHOOK_SECRET with SVIX_TOKEN?
+    const svixSecret = process.env.SVIX_WEBHOOK_SECRET; // TODO: we should ensure this holds the svix endpoint secret
+    if (!svixSecret) {
+      console.error(
+        "[STRIPE HOOK] missing SVIX_WEBHOOK_SECRET env var (svix enabled)",
+      );
+      return NextResponse.json(
+        { error: "svix webhook secret not configured" },
+        { status: 500 },
+      );
+    }
 
-      // If there are items in metadata, then create order
-      if (checkoutItems) {
-        try {
-          if (!event.account) {
-            throw new Error("No account found.");
-          }
+    const wh = new Webhook(svixSecret);
+    try {
+      event = wh.verify(body, svixHeaders) as StripeWebhookEvent;
+    } catch (error) {
+      console.error("[STRIPE HOOK] svix verification failed", error);
+      return NextResponse.json(
+        { error: "svix webhook verification failed" },
+        { status: 400 },
+      );
+    }
+  } else {
+    // native stripe verification logic (fallback)
+    const signature = headerPayload.get("stripe-signature");
+    if (!signature) {
+      console.error(
+        "[STRIPE HOOK] missing stripe-signature header (svix disabled)",
+      );
+      return NextResponse.json(
+        { error: "missing stripe signature" },
+        { status: 400 },
+      );
+    }
 
-          // Parsing items from metadata
-          // Didn't parse before because can pass the unparsed data directly to the order table items json column in the db
-          const safeParsedItems = z
-            .array(checkoutItemSchema)
-            .safeParse(
-              JSON.parse(paymentIntentSucceeded.metadata.items ?? "[]"),
-            );
+    // todo: 🤔 maybe it should be STRIPE_SVIX_WEBHOOK_SECRET/SVIX_WEBHOOK_SECRET with SVIX_TOKEN?
+    const stripeSecret = process.env.STRIPE_WEBHOOK_SECRET; // TODO: we should ensure this holds the native stripe secret
+    if (!stripeSecret) {
+      console.error(
+        "[STRIPE HOOK] missing STRIPE_WEBHOOK_SECRET env var (svix disabled)",
+      );
+      return NextResponse.json(
+        { error: "stripe webhook secret not configured" },
+        { status: 500 },
+      );
+    }
 
-          if (!safeParsedItems.success) {
-            throw new Error("Could not parse items.");
-          }
-
-          const payment = await db.query.payments.findFirst({
-            columns: {
-              storeId: true,
-            },
-            where: eq(payments.stripeAccountId, event.account),
-          });
-
-          if (!payment?.storeId) {
-            return new Response("Store not found.", { status: 404 });
-          }
-
-          // Create new address in DB
-          const stripeAddress = paymentIntentSucceeded.shipping?.address;
-
-          const newAddress = await db
-            .insert(addresses)
-            .values({
-              line1: stripeAddress?.line1,
-              line2: stripeAddress?.line2,
-              city: stripeAddress?.city,
-              state: stripeAddress?.state,
-              country: stripeAddress?.country,
-              postalCode: stripeAddress?.postal_code,
-            })
-            .returning({
-              insertedId: addresses.id,
-            });
-
-          if (!newAddress[0]?.insertedId) {
-            throw new Error("No address created.");
-          }
-
-          // Create new order in db
-          await db.insert(orders).values({
-            storeId: payment.storeId,
-            items: checkoutItems ?? [],
-            quantity: safeParsedItems.data.reduce(
-              (acc, item) => acc + item.quantity,
-              0,
-            ),
-            amount: String(Number(orderAmount) / 100),
-            stripePaymentIntentId: paymentIntentId,
-            stripePaymentIntentStatus: paymentIntentSucceeded.status,
-            name: paymentIntentSucceeded.shipping?.name ?? "",
-            email: paymentIntentSucceeded.receipt_email ?? "",
-            addressId: newAddress[0]?.insertedId,
-          });
-
-          // Update product inventory in db
-          for (const item of safeParsedItems.data) {
-            const product = await db.query.products.findFirst({
-              columns: {
-                id: true,
-                inventory: true,
-              },
-              where: eq(products.id, item.productId),
-            });
-
-            if (!product) {
-              throw new Error("Product not found.");
-            }
-
-            const inventory = product.inventory - item.quantity;
-
-            if (inventory < 0) {
-              throw new Error("Product out of stock.");
-            }
-
-            await db
-              .update(products)
-              .set({
-                inventory: product.inventory - item.quantity,
-              })
-              .where(eq(products.id, item.productId));
-          }
-
-          // Close cart and clear items
-          await db
-            .update(carts)
-            .set({
-              closed: true,
-              items: [],
-            })
-            .where(eq(carts.paymentIntentId, paymentIntentId));
-        } catch (err) {
-          console.log("Error creating order.", err);
-        }
-      }
-      break;
-    case "application_fee.created":
-      const applicationFeeCreated = event.data.object;
-      console.log(`Application fee id: ${applicationFeeCreated.id}`);
-      break;
-    case "charge.succeeded":
-      const chargeSucceeded = event.data.object;
-      console.log(`Charge id: ${chargeSucceeded.id}`);
-      break;
-    default:
-      console.warn(`Unhandled event type: ${event.type}`);
+    try {
+      // use stripe's native verification
+      // todo: we might need to adjust the type assertion if stripe's event structure differs slightly
+      // we cast to unknown first to satisfy typescript
+      event = stripe.webhooks.constructEvent(
+        body,
+        signature,
+        stripeSecret,
+      ) as unknown as StripeWebhookEvent;
+    } catch (error) {
+      console.error("[STRIPE HOOK] native stripe verification failed", error);
+      // return 400 for errors during verification
+      return NextResponse.json(
+        { error: "native stripe webhook verification failed" },
+        { status: 400 },
+      );
+    }
   }
 
-  return new Response(null, { status: 200 });
+  // common event processing logic
+  try {
+    await processEvent(event);
+  } catch (error) {
+    console.error("[STRIPE HOOK] error processing event", error);
+    // return 500 for processing errors
+    return NextResponse.json(
+      { error: "failed to process webhook" },
+      { status: 500 },
+    );
+  }
+
+  return NextResponse.json({ received: true });
+}
+
+async function processEvent(event: StripeWebhookEvent) {
+  if (!allowedEvents.includes(event.type)) return;
+  const { customer: customerId } = event.data.object;
+  if (typeof customerId !== "string") {
+    throw new Error(`[STRIPE HOOK] id isn't string. event type: ${event.type}`);
+  }
+  return await syncStripeDataToKV(customerId);
 }
