@@ -103,7 +103,7 @@ export function ProductCard({
         <Card
           className={cn(
             `
-              relative h-full overflow-hidden rounded-lg transition-all
+              relative h-full overflow-hidden rounded-lg py-0 transition-all
               duration-200 ease-in-out
               hover:shadow-md
             `,
